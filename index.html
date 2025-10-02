@@ -1,378 +1,343 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CBAM Embedded Emissions Calculator</title>
-    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    <script src="https://cdn.tailwindcss.com"></script>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>CBAM Embedded Emissions Calculator</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!--
+    Legal notes baked into logic:
+    - Phase-in (Art.31): 2026 2.5%, 2027 5%, 2028 10%, 2029 22.5%, 2030 48.5%, 2031 61%, 2032 73.5%, 2033 86%, 2034 100%.
+    - Indirect electricity emissions in definitive phase (from 2026) only for cement & fertilizers (steel/aluminium/hydrogen = direct only).
+    - CBAM price basis = weekly average EUA auction price (Art.21).
+    - First surrender for 2026 imports is due 2027 (original May 31; Omnibus moves to Aug 31 from 2028).
+    - Omnibus: 50 t/year per declarant exemption; defers 2026 purchases to 2027; quarterly holding illustrated at 50%.
+    - Defaults below are placeholders; load official Commission defaults and CBAM Registry grid factors for compliance use.
+  -->
 </head>
-<body>
-    <div id="root"></div>
-    
-    <script type="text/babel">
-        const { useState } = React;
+<body class="bg-slate-50">
+  <div id="root"></div>
 
-        function CBAMCalculator() {
-          const [product, setProduct] = useState('steel');
-          const [route, setRoute] = useState('bf-bof');
-          const [quantity, setQuantity] = useState(1000);
-          const [useActual, setUseActual] = useState(false);
-          const [directEF, setDirectEF] = useState('');
-          const [electricityUse, setElectricityUse] = useState('');
-          const [gridEF, setGridEF] = useState('');
-          const [euaPrice, setEuaPrice] = useState(77);
-          const [carbonPriceDeduction, setCarbonPriceDeduction] = useState(0);
+  <script type="text/babel">
+    const { useState, useMemo } = React;
 
-          // Default emission factors database
-          const defaults = {
-            steel: {
-              'bf-bof': { direct: 2.1, electricity: 0.5, gridEF: 0.45 },
-              'eaf': { direct: 0.4, electricity: 0.6, gridEF: 0.45 }
-            },
-            cement: {
-              'high-clinker': { direct: 0.95, electricity: 0.11, gridEF: 0.45 },
-              'blended': { direct: 0.70, electricity: 0.11, gridEF: 0.45 }
-            },
-            aluminum: {
-              'primary': { direct: 2.36, electricity: 15.0, gridEF: 0.54 },
-              'secondary': { direct: 1.0, electricity: 2.5, gridEF: 0.45 }
-            },
-            fertilizer: {
-              'ammonia': { direct: 2.68, electricity: 0.14, gridEF: 0.45 },
-              'urea': { direct: 1.78, electricity: 0.12, gridEF: 0.45 }
-            },
-            hydrogen: {
-              'smr': { direct: 10.4, electricity: 0.0, gridEF: 0.45 },
-              'electrolysis': { direct: 0.5, electricity: 55.0, gridEF: 0.45 }
-            }
-          };
+    function CBAMCalculator() {
+      // --- State ---
+      const [product, setProduct] = useState("steel");
+      const [route, setRoute] = useState("bf-bof");
+      const [quantity, setQuantity] = useState(1000); // tonnes imported this calendar year by this declarant
+      const [importYear, setImportYear] = useState(2026);
+      const [useActual, setUseActual] = useState(false);
 
-          const productOptions = {
-            steel: { label: 'Steel', routes: { 'bf-bof': 'Blast Furnace-BOF', 'eaf': 'Electric Arc Furnace (EAF)' }},
-            cement: { label: 'Cement', routes: { 'high-clinker': 'High Clinker Content', 'blended': 'Blended Cement' }},
-            aluminum: { label: 'Aluminum', routes: { 'primary': 'Primary Smelting', 'secondary': 'Secondary (Recycled)' }},
-            fertilizer: { label: 'Fertilizers', routes: { 'ammonia': 'Ammonia', 'urea': 'Urea' }},
-            hydrogen: { label: 'Hydrogen', routes: { 'smr': 'Steam Methane Reforming', 'electrolysis': 'Electrolysis' }}
-          };
+      // Inputs for "actuals"
+      const [directEF, setDirectEF] = useState("");       // tCO2e/t product
+      const [electricityUse, setElectricityUse] = useState(""); // MWh/t product
+      const [gridEF, setGridEF] = useState("");           // tCO2e/MWh
 
-          const currentDefaults = defaults[product]?.[route] || { direct: 0, electricity: 0, gridEF: 0 };
+      // Market & policy inputs
+      const [euaPrice, setEuaPrice] = useState(77);       // €/tCO2e (weekly avg auction proxy)
+      const [foreignCarbonPrice, setForeignCarbonPrice] = useState(0); // €/tCO2e actually paid abroad
 
-          // Calculations
-          const effectiveDirectEF = useActual && directEF ? parseFloat(directEF) : currentDefaults.direct;
-          const effectiveElecUse = useActual && electricityUse ? parseFloat(electricityUse) : currentDefaults.electricity;
-          const effectiveGridEF = useActual && gridEF ? parseFloat(gridEF) : currentDefaults.gridEF;
+      // --- Phase-in schedule (Art. 31) ---
+      const phaseInMap = {
+        2026: 0.025, 2027: 0.05, 2028: 0.10, 2029: 0.225,
+        2030: 0.485, 2031: 0.61, 2032: 0.735, 2033: 0.86, 2034: 1
+      };
+      const phaseIn = phaseInMap[importYear] ?? 1;
 
-          const directEmissions = quantity * effectiveDirectEF;
-          const indirectEmissions = quantity * effectiveElecUse * effectiveGridEF;
-          const totalEmissions = directEmissions + indirectEmissions;
-          const certificatesNeeded = totalEmissions;
-          const grossCost = totalEmissions * euaPrice;
-          const netCost = totalEmissions * Math.max(0, euaPrice - carbonPriceDeduction);
-          
-          // Compare with defaults if using actual values
-          const defaultDirectEmissions = quantity * currentDefaults.direct;
-          const defaultIndirectEmissions = quantity * currentDefaults.electricity * currentDefaults.gridEF;
-          const defaultTotalEmissions = defaultDirectEmissions + defaultIndirectEmissions;
-          const defaultCost = defaultTotalEmissions * euaPrice;
-          const savings = useActual ? defaultCost - grossCost : 0;
+      // --- Product routes & placeholder defaults (override with official values in production) ---
+      const productOptions = {
+        steel: { label: "Steel", routes: { "bf-bof": "Blast Furnace-BOF", "eaf": "Electric Arc Furnace (EAF)" } },
+        cement: { label: "Cement", routes: { "high-clinker": "High Clinker Content", "blended": "Blended Cement" } },
+        aluminum: { label: "Aluminum", routes: { "primary": "Primary Smelting", "secondary": "Secondary (Recycled)" } },
+        fertilizer: { label: "Fertilizers", routes: { "ammonia": "Ammonia", "urea": "Urea" } },
+        hydrogen: { label: "Hydrogen", routes: { "smr": "Steam Methane Reforming", "electrolysis": "Electrolysis" } },
+      };
 
-          return (
-            <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 p-4">
-              <div className="max-w-6xl mx-auto">
-                <div className="bg-white rounded-xl shadow-lg overflow-hidden">
-                  {/* Header */}
-                  <div className="bg-gradient-to-r from-emerald-600 to-teal-600 p-6 text-white">
-                    <div className="flex items-center gap-3 mb-2">
-                      <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 7h6m0 10v-3m-3 3h.01M9 17h.01M9 14h.01M12 14h.01M15 11h.01M12 11h.01M9 11h.01M7 21h10a2 2 0 002-2V5a2 2 0 00-2-2H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
-                      </svg>
-                      <h1 className="text-3xl font-bold">CBAM Embedded Emissions Calculator</h1>
+      // Placeholder defaults (DO NOT treat as official)
+      const defaults = {
+        steel: {
+          "bf-bof": { direct: 2.10, electricity: 0.50, gridEF: 0.45 },
+          "eaf":    { direct: 0.40, electricity: 0.60, gridEF: 0.45 }
+        },
+        cement: {
+          "high-clinker": { direct: 0.95, electricity: 0.11, gridEF: 0.45 },
+          "blended":      { direct: 0.70, electricity: 0.11, gridEF: 0.45 }
+        },
+        aluminum: {
+          "primary":   { direct: 2.36, electricity: 15.0, gridEF: 0.54 },
+          "secondary": { direct: 1.00, electricity: 2.50, gridEF: 0.45 }
+        },
+        fertilizer: {
+          "ammonia": { direct: 2.68, electricity: 0.14, gridEF: 0.45 },
+          "urea":    { direct: 1.78, electricity: 0.12, gridEF: 0.45 }
+        },
+        hydrogen: {
+          "smr":         { direct: 10.4, electricity: 0.0, gridEF: 0.45 },
+          "electrolysis":{ direct: 0.5,  electricity: 55.0, gridEF: 0.45 }
+        }
+      };
+
+      const currentDefaults = defaults[product]?.[route] || { direct: 0, electricity: 0, gridEF: 0 };
+
+      // --- Definitive phase & indirects gating (from 2026) ---
+      const definitivePhase = importYear >= 2026;
+      const includesIndirect = definitivePhase
+        ? (product === "cement" || product === "fertilizer") // only these include indirects in definitive phase
+        : true; // pre-2026 (transitional) you may show both for analysis
+
+      // --- Effective factors (actual vs defaults) ---
+      const effectiveDirectEF = useActual && directEF ? parseFloat(directEF) : currentDefaults.direct;               // tCO2e/t
+      const effectiveElecUse  = useActual && electricityUse ? parseFloat(electricityUse) : currentDefaults.electricity; // MWh/t
+      const effectiveGridEF   = useActual && gridEF ? parseFloat(gridEF) : currentDefaults.gridEF;                   // tCO2e/MWh
+
+      // --- Emissions ---
+      const directEmissions   = quantity * effectiveDirectEF; // tCO2e
+      const indirectEmissions = includesIndirect ? (quantity * effectiveElecUse * effectiveGridEF) : 0; // tCO2e
+      const totalEmissions    = directEmissions + indirectEmissions; // tCO2e
+
+      // --- CBAM price & Art. 9 reduction (compute certificates, then cost) ---
+      const cbamPrice         = euaPrice;                           // €/tCO2e, weekly avg EUA auction proxy
+      const reductionFactor   = Math.max(0, 1 - (foreignCarbonPrice > 0 && cbamPrice > 0 ? (foreignCarbonPrice / cbamPrice) : 0));
+      const certificatesNeeded = totalEmissions * phaseIn * reductionFactor; // tCO2e to surrender
+      const totalCost         = certificatesNeeded * cbamPrice;     // €
+
+      // --- Defaults comparison (for UX only) ---
+      const defaultDirectEmissions   = quantity * currentDefaults.direct;
+      const defaultIndirectEmissions = (includesIndirect ? quantity * currentDefaults.electricity * currentDefaults.gridEF : 0);
+      const defaultTotalEmissions    = defaultDirectEmissions + defaultIndirectEmissions;
+      const defaultCertificates      = defaultTotalEmissions * phaseIn * reductionFactor;
+      const defaultCost              = defaultCertificates * cbamPrice;
+      const savingsVsDefault         = useActual ? (defaultCost - totalCost) : 0;
+
+      // --- Omnibus simplifications (UX flags only; not legal advice) ---
+      const deMinimis50t = quantity < 50; // simplistic per-declarant annual check for demo
+      const quarterlyHoldingPct = 0.50;   // Omnibus reduced from 80% to 50%
+      const quarterlyMinimum = certificatesNeeded * quarterlyHoldingPct;
+
+      // --- Info banners ---
+      const show2026Deferral = importYear === 2026;
+
+      // --- Helpers ---
+      const num = (x, d=2) => Number(x).toLocaleString("en-US", { minimumFractionDigits:d, maximumFractionDigits:d });
+
+      return (
+        <div className="min-h-screen p-4">
+          <div className="max-w-6xl mx-auto">
+            <div className="bg-white rounded-2xl shadow-lg overflow-hidden">
+              {/* Header */}
+              <div className="bg-gradient-to-r from-emerald-600 to-teal-600 p-6 text-white">
+                <div className="flex items-center gap-3 mb-2">
+                  <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                      d="M9 7h6m0 10v-3m-3 3h.01M9 17h.01M9 14h.01M12 14h.01M15 11h.01M12 11h.01M9 11h.01M7 21h10a2 2 0 002-2V5a2 2 0 00-2-2H7a2 2 0 00-2 2v14a2 2 0 002 2z"/>
+                  </svg>
+                  <h1 className="text-3xl font-bold">CBAM Embedded Emissions Calculator</h1>
+                </div>
+                <p className="text-emerald-50">Aligned to Regulation (EU) 2023/956 + 2025 Omnibus simplifications (UX hints)</p>
+              </div>
+
+              <div className="p-6 grid md:grid-cols-2 gap-6">
+                {/* Left: Inputs */}
+                <div className="space-y-4">
+                  <h2 className="text-xl font-semibold text-slate-800 mb-2">Product Details</h2>
+
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-slate-700 mb-1">Product Category</label>
+                      <select
+                        value={product}
+                        onChange={(e) => {
+                          const next = e.target.value;
+                          setProduct(next);
+                          setRoute(Object.keys(productOptions[next].routes)[0]);
+                        }}
+                        className="w-full p-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-emerald-500">
+                        {Object.entries(productOptions).map(([k, v]) => (
+                          <option key={k} value={k}>{v.label}</option>
+                        ))}
+                      </select>
                     </div>
-                    <p className="text-emerald-50">Calculate your Carbon Border Adjustment Mechanism liability</p>
+
+                    <div>
+                      <label className="block text-sm font-medium text-slate-700 mb-1">Production Route</label>
+                      <select
+                        value={route}
+                        onChange={(e) => setRoute(e.target.value)}
+                        className="w-full p-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-emerald-500">
+                        {Object.entries(productOptions[product].routes).map(([k, v]) => (
+                          <option key={k} value={k}>{v}</option>
+                        ))}
+                      </select>
+                    </div>
                   </div>
 
-                  <div className="p-6 grid md:grid-cols-2 gap-6">
-                    {/* Left Column - Inputs */}
-                    <div className="space-y-4">
-                      <h2 className="text-xl font-semibold text-slate-800 mb-4">Product Details</h2>
-                      
-                      {/* Product Selection */}
-                      <div>
-                        <label className="block text-sm font-medium text-slate-700 mb-1">Product Category</label>
-                        <select 
-                          value={product}
-                          onChange={(e) => {
-                            setProduct(e.target.value);
-                            setRoute(Object.keys(productOptions[e.target.value].routes)[0]);
-                          }}
-                          className="w-full p-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
-                        >
-                          {Object.entries(productOptions).map(([key, val]) => (
-                            <option key={key} value={key}>{val.label}</option>
-                          ))}
-                        </select>
-                      </div>
-
-                      {/* Production Route */}
-                      <div>
-                        <label className="block text-sm font-medium text-slate-700 mb-1">Production Route</label>
-                        <select 
-                          value={route}
-                          onChange={(e) => setRoute(e.target.value)}
-                          className="w-full p-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
-                        >
-                          {Object.entries(productOptions[product].routes).map(([key, val]) => (
-                            <option key={key} value={key}>{val}</option>
-                          ))}
-                        </select>
-                      </div>
-
-                      {/* Quantity */}
-                      <div>
-                        <label className="block text-sm font-medium text-slate-700 mb-1">
-                          Quantity Imported (tonnes)
-                        </label>
-                        <input 
-                          type="number"
-                          value={quantity}
-                          onChange={(e) => setQuantity(parseFloat(e.target.value) || 0)}
-                          className="w-full p-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
-                        />
-                      </div>
-
-                      {/* Use Actual Values Toggle */}
-                      <div className="bg-slate-50 p-4 rounded-lg">
-                        <label className="flex items-center gap-2 cursor-pointer">
-                          <input 
-                            type="checkbox"
-                            checked={useActual}
-                            onChange={(e) => setUseActual(e.target.checked)}
-                            className="w-4 h-4 text-emerald-600 focus:ring-emerald-500"
-                          />
-                          <span className="text-sm font-medium text-slate-700">
-                            Use Actual Values (verified supplier data)
-                          </span>
-                        </label>
-                      </div>
-
-                      {/* Actual Values Inputs */}
-                      {useActual && (
-                        <div className="space-y-3 bg-blue-50 p-4 rounded-lg">
-                          <div>
-                            <label className="block text-sm font-medium text-slate-700 mb-1">
-                              Direct Emission Factor (tCO₂/t)
-                            </label>
-                            <input 
-                              type="number"
-                              step="0.01"
-                              value={directEF}
-                              onChange={(e) => setDirectEF(e.target.value)}
-                              placeholder={currentDefaults.direct.toFixed(2)}
-                              className="w-full p-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500"
-                            />
-                          </div>
-                          <div>
-                            <label className="block text-sm font-medium text-slate-700 mb-1">
-                              Electricity Use (MWh/t)
-                            </label>
-                            <input 
-                              type="number"
-                              step="0.01"
-                              value={electricityUse}
-                              onChange={(e) => setElectricityUse(e.target.value)}
-                              placeholder={currentDefaults.electricity.toFixed(2)}
-                              className="w-full p-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500"
-                            />
-                          </div>
-                          <div>
-                            <label className="block text-sm font-medium text-slate-700 mb-1">
-                              Grid Emission Factor (tCO₂/MWh)
-                            </label>
-                            <input 
-                              type="number"
-                              step="0.01"
-                              value={gridEF}
-                              onChange={(e) => setGridEF(e.target.value)}
-                              placeholder={currentDefaults.gridEF.toFixed(2)}
-                              className="w-full p-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500"
-                            />
-                          </div>
-                        </div>
-                      )}
-
-                      <h2 className="text-xl font-semibold text-slate-800 mb-4 mt-6">Market Prices</h2>
-
-                      {/* EUA Price */}
-                      <div>
-                        <label className="block text-sm font-medium text-slate-700 mb-1">
-                          EUA Price (€/tCO₂)
-                        </label>
-                        <input 
-                          type="number"
-                          value={euaPrice}
-                          onChange={(e) => setEuaPrice(parseFloat(e.target.value) || 0)}
-                          className="w-full p-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
-                        />
-                      </div>
-
-                      {/* Carbon Price Deduction */}
-                      <div>
-                        <label className="block text-sm font-medium text-slate-700 mb-1">
-                          Origin Country Carbon Price Deduction (€/tCO₂)
-                        </label>
-                        <input 
-                          type="number"
-                          value={carbonPriceDeduction}
-                          onChange={(e) => setCarbonPriceDeduction(parseFloat(e.target.value) || 0)}
-                          className="w-full p-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
-                        />
-                        <p className="text-xs text-slate-500 mt-1">
-                          e.g., UK ETS ≈ €47/t, China ETS ≈ €8/t (Article 9 CBAM Regulation)
-                        </p>
-                      </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-slate-700 mb-1">Quantity Imported (t)</label>
+                      <input
+                        type="number" min="0" step="0.01"
+                        value={quantity}
+                        onChange={(e)=> setQuantity(parseFloat(e.target.value) || 0)}
+                        className="w-full p-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-emerald-500"/>
+                      <p className="text-xs text-slate-500 mt-1">Used here as your annual total (per declarant) for the 50-t check.</p>
                     </div>
 
-                    {/* Right Column - Results */}
-                    <div className="space-y-4">
-                      <h2 className="text-xl font-semibold text-slate-800 mb-4">Results</h2>
-                      
-                      {/* Emissions Breakdown */}
-                      <div className="bg-gradient-to-br from-emerald-50 to-teal-50 p-4 rounded-lg border border-emerald-200">
-                        <h3 className="font-semibold text-emerald-900 mb-3 flex items-center gap-2">
-                          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
-                          </svg>
-                          Embedded Emissions
-                        </h3>
-                        <div className="space-y-2 text-sm">
-                          <div className="flex justify-between">
-                            <span className="text-slate-700">Direct Emissions:</span>
-                            <span className="font-semibold text-slate-900">{directEmissions.toFixed(2)} tCO₂</span>
-                          </div>
-                          <div className="flex justify-between">
-                            <span className="text-slate-700">Indirect Emissions:</span>
-                            <span className="font-semibold text-slate-900">{indirectEmissions.toFixed(2)} tCO₂</span>
-                          </div>
-                          <div className="border-t border-emerald-200 pt-2 mt-2">
-                            <div className="flex justify-between">
-                              <span className="text-slate-900 font-semibold">Total Emissions:</span>
-                              <span className="font-bold text-emerald-900 text-lg">{totalEmissions.toFixed(2)} tCO₂e</span>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-700 mb-1">Year of Import</label>
+                      <select
+                        value={importYear}
+                        onChange={(e)=> setImportYear(parseInt(e.target.value))}
+                        className="w-full p-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-emerald-500">
+                        {[2026,2027,2028,2029,2030,2031,2032,2033,2034].map(y => <option key={y} value={y}>{y}</option>)}
+                      </select>
+                      <p className="text-xs text-slate-500 mt-1">Phase-in multiplier applies by import year.</p>
+                    </div>
+                  </div>
 
-                      {/* CBAM Certificates */}
-                      <div className="bg-gradient-to-br from-blue-50 to-indigo-50 p-4 rounded-lg border border-blue-200">
-                        <h3 className="font-semibold text-blue-900 mb-3 flex items-center gap-2">
-                          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                          </svg>
-                          CBAM Certificate Requirement
-                        </h3>
-                        <div className="space-y-2 text-sm">
-                          <div className="flex justify-between">
-                            <span className="text-slate-700">Certificates Needed:</span>
-                            <span className="font-semibold text-slate-900">{certificatesNeeded.toFixed(2)}</span>
-                          </div>
-                          <div className="flex justify-between">
-                            <span className="text-slate-700">Gross Cost (Article 21):</span>
-                            <span className="font-semibold text-slate-900">€{grossCost.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span>
-                          </div>
-                          {carbonPriceDeduction > 0 && (
-                            <>
-                              <div className="flex justify-between text-green-700">
-                                <span>Carbon Price Deduction:</span>
-                                <span className="font-semibold">-€{(totalEmissions * carbonPriceDeduction).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span>
-                              </div>
-                              <div className="border-t border-blue-200 pt-2 mt-2">
-                                <div className="flex justify-between">
-                                  <span className="text-slate-900 font-semibold">Net Cost (Article 9):</span>
-                                  <span className="font-bold text-blue-900 text-lg">€{netCost.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span>
-                                </div>
-                              </div>
-                            </>
-                          )}
-                        </div>
-                      </div>
+                  <div className="bg-slate-50 p-3 rounded-lg">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={useActual}
+                        onChange={(e) => setUseActual(e.target.checked)}
+                        className="w-4 h-4 text-emerald-600 focus:ring-emerald-500"/>
+                      <span className="text-sm font-medium text-slate-700">Use Actual Values (verified supplier data)</span>
+                    </label>
+                  </div>
 
-                      {/* Savings from Actual Values */}
-                      {useActual && savings !== 0 && (
-                        <div className={`p-4 rounded-lg border ${savings > 0 ? 'bg-green-50 border-green-200' : 'bg-red-50 border-red-200'}`}>
-                          <h3 className={`font-semibold mb-2 flex items-center gap-2 ${savings > 0 ? 'text-green-900' : 'text-red-900'}`}>
-                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                            </svg>
-                            {savings > 0 ? 'Savings vs. Default Values' : 'Additional Cost vs. Defaults'}
-                          </h3>
-                          <div className="space-y-2 text-sm">
-                            <div className="flex justify-between">
-                              <span className="text-slate-700">Default Emissions:</span>
-                              <span className="font-semibold">{defaultTotalEmissions.toFixed(2)} tCO₂e</span>
-                            </div>
-                            <div className="flex justify-between">
-                              <span className="text-slate-700">Default Cost:</span>
-                              <span className="font-semibold">€{defaultCost.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span>
-                            </div>
-                            <div className="border-t pt-2 mt-2">
-                              <div className="flex justify-between">
-                                <span className={`font-semibold ${savings > 0 ? 'text-green-900' : 'text-red-900'}`}>
-                                  {savings > 0 ? 'You Save:' : 'Extra Cost:'}
-                                </span>
-                                <span className={`font-bold text-lg ${savings > 0 ? 'text-green-900' : 'text-red-900'}`}>
-                                  €{Math.abs(savings).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}
-                                </span>
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-                      )}
-
-                      {/* Summary Metrics */}
-                      <div className="bg-slate-50 p-4 rounded-lg">
-                        <h3 className="font-semibold text-slate-900 mb-3">Per-Tonne Metrics</h3>
-                        <div className="space-y-2 text-sm">
-                          <div className="flex justify-between">
-                            <span className="text-slate-700">Emissions Intensity:</span>
-                            <span className="font-semibold">{(totalEmissions / quantity).toFixed(3)} tCO₂e/t product</span>
-                          </div>
-                          <div className="flex justify-between">
-                            <span className="text-slate-700">CBAM Cost per Tonne:</span>
-                            <span className="font-semibold">€{(netCost / quantity).toFixed(2)}/t product</span>
-                          </div>
-                        </div>
+                  {useActual && (
+                    <div className="space-y-3 bg-blue-50 p-4 rounded-lg">
+                      <div>
+                        <label className="block text-sm font-medium text-slate-700 mb-1">Direct Emission Factor (tCO₂e/t)</label>
+                        <input type="number" step="0.001" value={directEF} onChange={(e)=> setDirectEF(e.target.value)}
+                          placeholder={defaults[product][route].direct.toFixed(2)}
+                          className="w-full p-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500"/>
                       </div>
-
-                      {/* Info Box */}
-                      <div className="bg-amber-50 border border-amber-200 p-4 rounded-lg">
-                        <div className="flex gap-2">
-                          <svg className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                          </svg>
-                          <div className="text-sm text-slate-700">
-                            <p className="font-semibold text-amber-900 mb-1">Note:</p>
-                            <p>Default values are conservative estimates from Commission document December 22, 2023 (JRC Report JRC134682). Using verified actual values from suppliers typically reduces CBAM costs by 10-30% but requires third-party verification per Article 8.</p>
-                          </div>
-                        </div>
+                      <div>
+                        <label className="block text-sm font-medium text-slate-700 mb-1">Electricity Use (MWh/t)</label>
+                        <input type="number" step="0.01" value={electricityUse} onChange={(e)=> setElectricityUse(e.target.value)}
+                          placeholder={defaults[product][route].electricity.toFixed(2)}
+                          className="w-full p-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500"/>
                       </div>
+                      <div>
+                        <label className="block text-sm font-medium text-slate-700 mb-1">Grid Emission Factor (tCO₂e/MWh)</label>
+                        <input type="number" step="0.001" value={gridEF} onChange={(e)=> setGridEF(e.target.value)}
+                          placeholder={defaults[product][route].gridEF.toFixed(2)}
+                          className="w-full p-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500"/>
+                      </div>
+                      <p className="text-xs text-slate-600">Enter supplier-verified data; verifier required in definitive period.</p>
+                    </div>
+                  )}
+
+                  <h2 className="text-xl font-semibold text-slate-800 mt-6">Market & Policy</h2>
+
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-slate-700 mb-1">CBAM Price (€/tCO₂e)</label>
+                      <input type="number" step="0.01" value={euaPrice} onChange={(e)=> setEuaPrice(parseFloat(e.target.value) || 0)}
+                        className="w-full p-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-emerald-500"/>
+                      <p className="text-xs text-slate-500 mt-1">Proxy for weekly average EUA auction price (Art. 21).</p>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-700 mb-1">Foreign Carbon Price Paid (€/tCO₂e)</label>
+                      <input type="number" step="0.01" value={foreignCarbonPrice}
+                        onChange={(e)=> setForeignCarbonPrice(parseFloat(e.target.value) || 0)}
+                        className="w-full p-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-emerald-500"/>
+                      <p className="text-xs text-slate-500 mt-1">Article 9 deduction (net of rebates), verified and documented.</p>
                     </div>
                   </div>
                 </div>
 
-                {/* Footer Info */}
-                <div className="mt-6 text-center text-sm text-slate-600">
-                  <p>CBAM definitive phase starts January 1, 2026 (Regulation EU 2023/956) | Current EUA price: €{euaPrice}/t</p>
-                  <p className="mt-1">Tool provided for educational purposes. Consult official EU guidance for compliance.</p>
+                {/* Right: Results */}
+                <div className="space-y-4">
+                  {/* Omnibus banners */}
+                  {deMinimis50t && (
+                    <div className="bg-amber-50 border border-amber-200 p-3 rounded-lg text-sm">
+                      <b>Exemption likely:</b> Total covered imports &lt; 50 t this year (per declarant). Check Omnibus 2025 details & Member State guidance.
+                    </div>
+                  )}
+
+                  {show2026Deferral && (
+                    <div className="bg-sky-50 border border-sky-200 p-3 rounded-lg text-sm">
+                      <b>2026 cash-flow deferral:</b> certificate purchases for 2026 imports occur from <i>Feb 2027</i>. Plan holdings & budget accordingly.
+                    </div>
+                  )}
+
+                  {/* Emissions */}
+                  <div className="bg-gradient-to-br from-emerald-50 to-teal-50 p-4 rounded-lg border border-emerald-200">
+                    <h3 className="font-semibold text-emerald-900 mb-3">Embedded Emissions</h3>
+                    <div className="space-y-2 text-sm">
+                      <div className="flex justify-between"><span>Direct emissions</span><span className="font-semibold">{num(directEmissions)} tCO₂e</span></div>
+                      <div className="flex justify-between"><span>Indirect electricity</span><span className="font-semibold">{num(indirectEmissions)} tCO₂e</span></div>
+                      <div className="border-t border-emerald-200 pt-2 mt-2 flex justify-between">
+                        <span className="font-semibold">Total</span><span className="font-bold text-emerald-900 text-lg">{num(totalEmissions)} tCO₂e</span>
+                      </div>
+                      <p className="text-xs text-slate-600 mt-1">
+                        From 2026, indirect electricity applies only to <b>cement & fertilizers</b>; steel/aluminium/hydrogen are direct-only.
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Certificates */}
+                  <div className="bg-gradient-to-br from-blue-50 to-indigo-50 p-4 rounded-lg border border-blue-200">
+                    <h3 className="font-semibold text-blue-900 mb-3">CBAM Certificates</h3>
+                    <div className="space-y-2 text-sm">
+                      <div className="flex justify-between"><span>Phase-in multiplier</span><span className="font-semibold">{num(phaseIn*100,1)}%</span></div>
+                      <div className="flex justify-between"><span>Foreign price reduction factor</span><span className="font-semibold">{num(reductionFactor,3)}</span></div>
+                      <div className="flex justify-between"><span>Certificates to surrender</span><span className="font-semibold">{num(certificatesNeeded)}</span></div>
+                      <div className="flex justify-between"><span>Estimated cost</span><span className="font-semibold">€{num(totalCost)}</span></div>
+                    </div>
+
+                    <div className="mt-3 text-xs text-slate-600">
+                      <p><b>Quarterly holding (illustrative):</b> {num(quarterlyMinimum)} certificates ({quarterlyHoldingPct*100}% of year-to-date). Omnibus lowered from 80%.</p>
+                      <p className="mt-1"><b>Surrender deadline:</b> First for 2026 imports due in 2027 (originally May 31; Omnibus extends to Aug 31 from 2028).</p>
+                    </div>
+                  </div>
+
+                  {/* Savings vs defaults */}
+                  {useActual && (
+                    <div className={`p-4 rounded-lg border ${savingsVsDefault >= 0 ? "bg-green-50 border-green-200" : "bg-red-50 border-red-200"}`}>
+                      <h3 className={`font-semibold mb-2 ${savingsVsDefault >= 0 ? "text-green-900" : "text-red-900"}`}>
+                        {savingsVsDefault >= 0 ? "Savings vs. default inputs" : "Additional cost vs. default inputs"}
+                      </h3>
+                      <div className="text-sm space-y-1">
+                        <div className="flex justify-between"><span>Default certificates</span><span className="font-semibold">{num(defaultCertificates)}</span></div>
+                        <div className="flex justify-between"><span>Default cost</span><span className="font-semibold">€{num(defaultCost)}</span></div>
+                        <div className="border-t pt-2 mt-2 flex justify-between">
+                          <span className={`font-semibold ${savingsVsDefault >= 0 ? "text-green-900" : "text-red-900"}`}>{savingsVsDefault >= 0 ? "You save" : "Extra cost"}</span>
+                          <span className={`font-bold text-lg ${savingsVsDefault >= 0 ? "text-green-900" : "text-red-900"}`}>€{num(Math.abs(savingsVsDefault))}</span>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Per-tonne metrics */}
+                  <div className="bg-slate-50 p-4 rounded-lg">
+                    <h3 className="font-semibold text-slate-900 mb-2">Per-tonne Metrics</h3>
+                    <div className="text-sm space-y-1">
+                      <div className="flex justify-between"><span>Emissions intensity</span><span className="font-semibold">{quantity > 0 ? num(totalEmissions/quantity,3) : "0.000"} tCO₂e/t</span></div>
+                      <div className="flex justify-between"><span>CBAM cost per tonne</span><span className="font-semibold">€{quantity > 0 ? num(totalCost/quantity,2) : "0.00"}/t</span></div>
+                    </div>
+                  </div>
                 </div>
               </div>
-            </div>
-          );
-        }
 
-        ReactDOM.render(<CBAMCalculator />, document.getElementById('root'));
-    </script>
+              {/* Footer */}
+              <div className="px-6 pb-6 text-center text-sm text-slate-600">
+                <p>Definitive phase starts 1 Jan 2026; only authorised declarants may import CBAM goods. First surrender for 2026 imports occurs in 2027.</p>
+                <p className="mt-1">Defaults here are placeholders. For compliance, load Commission default values (Dec 22 2023) and CBAM Registry electricity factors.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<CBAMCalculator />);
+  </script>
 </body>
 </html>
